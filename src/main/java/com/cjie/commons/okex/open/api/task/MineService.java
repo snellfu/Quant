@@ -1,15 +1,21 @@
 package com.cjie.commons.okex.open.api.task;
 
 import com.alibaba.fastjson.JSON;
+import com.alibaba.fastjson.TypeReference;
+import com.cjie.commons.okex.open.api.bean.account.result.ValuationTicker;
+import com.cjie.commons.okex.open.api.bean.account.result.Wallet;
 import com.cjie.commons.okex.open.api.bean.spot.param.PlaceOrderParam;
 import com.cjie.commons.okex.open.api.bean.spot.result.Account;
 import com.cjie.commons.okex.open.api.bean.spot.result.OrderInfo;
+import com.cjie.commons.okex.open.api.bean.spot.result.ResponseResult;
 import com.cjie.commons.okex.open.api.bean.spot.result.Ticker;
+import com.cjie.commons.okex.open.api.service.account.AccountAPIService;
 import com.cjie.commons.okex.open.api.service.spot.SpotAccountAPIService;
 import com.cjie.commons.okex.open.api.service.spot.SpotOrderAPIServive;
 import com.cjie.commons.okex.open.api.service.spot.SpotProductAPIService;
 import com.cjie.cryptocurrency.quant.model.APIKey;
 import com.cjie.cryptocurrency.quant.service.ApiKeyService;
+import com.cjie.cryptocurrency.quant.service.WeiXinMessageService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpEntity;
@@ -18,12 +24,15 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.StringHttpMessageConverter;
 import org.springframework.stereotype.Component;
+import org.springframework.util.CollectionUtils;
 import org.springframework.util.MultiValueMap;
 import org.springframework.web.client.RestTemplate;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -43,6 +52,12 @@ public class MineService {
 
     @Autowired
     private ApiKeyService  apiKeyService;
+
+    @Autowired
+    private WeiXinMessageService weiXinMessageService;
+
+    @Autowired
+    private AccountAPIService accountAPIService;
 
 
     private static double initMultiple = 3;
@@ -64,7 +79,117 @@ public class MineService {
         MineService.minLimitPriceOrderNums.put("cac", 1.0);
     }
 
+    public ValuationTicker getValuationTicker() {
+        MultiValueMap<String, String> headers = new HttpHeaders();
+        headers.add("Referer", "www.okb.com");
+        headers.add("user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/68.0.3440.84 Safari/537.36");
+        HttpEntity requestEntity = new HttpEntity<>(headers);
 
+        String url =  "https://www.okb.com/v2/futures/market/indexTicker.do?symbol=f_usd_btc";
+        RestTemplate client = new RestTemplate();
+        log.info(url);
+        client.getMessageConverters().set(1, new StringHttpMessageConverter(StandardCharsets.UTF_8));
+        ResponseEntity<String> response = client.exchange(url, HttpMethod.GET, requestEntity, String.class);
+        String body = response.getBody();
+        log.info(body);
+        ResponseResult<ValuationTicker> result = JSON.parseObject(body,new TypeReference<ResponseResult<ValuationTicker>>(){});
+        return result.getData();
+
+        //return spotProductAPIService.getTickerByProductId(baseCurrency.toUpperCase() + "-" + quotaCurrency.toUpperCase());
+    }
+
+    public void collectBalance() throws InterruptedException {
+
+        StringBuilder sb = new StringBuilder();
+
+        String[] sites = new String[]{"coinall"};
+        BigDecimal sum = BigDecimal.ZERO;
+        ValuationTicker valuationTicker = getValuationTicker();
+        for (String site : sites) {
+            BigDecimal spotAmount = getSpotValuation(site).setScale(8, RoundingMode.DOWN);
+            BigDecimal spotUsdtAmount = spotAmount.multiply(valuationTicker.getLast()).setScale(8, RoundingMode.DOWN);
+            BigDecimal spotCnyAmount = spotUsdtAmount.multiply(valuationTicker.getUsdCnyRate()).setScale(8, RoundingMode.DOWN);
+            sb.append(site).append(":").append("spot:").append(spotAmount)
+                    .append("usdt:").append(spotUsdtAmount)
+                    .append("cny:").append(spotCnyAmount)
+                    .append("\r\n\r\n");
+            sum = sum.add(spotAmount);
+            BigDecimal walletAmount = getWalletValuation(site).setScale(8, RoundingMode.DOWN);
+            BigDecimal walletUsdtAmount = walletAmount.multiply(valuationTicker.getLast()).setScale(8, RoundingMode.DOWN);
+            BigDecimal walletCnyAmount = walletUsdtAmount.multiply(valuationTicker.getUsdCnyRate()).setScale(8, RoundingMode.DOWN);
+            sb.append(site).append(":").append("wallet:").append(walletAmount)
+                    .append("usdt:").append(walletUsdtAmount)
+                    .append("cny:").append(walletCnyAmount)
+                    .append("\r\n\n");
+            sum = sum.add(walletAmount);
+        }
+        sum = sum.setScale(8, RoundingMode.DOWN);
+        BigDecimal usdtSum = sum.multiply(valuationTicker.getLast()).setScale(8, RoundingMode.DOWN);
+        BigDecimal cnySum = usdtSum.multiply(valuationTicker.getUsdCnyRate()).setScale(8, RoundingMode.DOWN);
+        sb.append("all").append(":").append(sum).append("usdt:").append(usdtSum).append("cny:").append(cnySum);
+        weiXinMessageService.sendMessage("balance", sb.toString());
+
+    }
+
+    private BigDecimal getSpotValuation(String site) throws InterruptedException {
+        BigDecimal sum = BigDecimal.ZERO;
+        List<Account> accounts = spotAccountAPIService.getAccounts(site);
+        if (!CollectionUtils.isEmpty(accounts)) {
+            for (Account account : accounts) {
+                if (Double.parseDouble(account.getBalance()) > 0) {
+                    if ("usdt".equalsIgnoreCase(account.getCurrency())) {
+                        Ticker ticker = getTicker(site, "btc", "usdt");
+                        sum = sum.add(new BigDecimal(account.getBalance()).divide(new BigDecimal(ticker.getLast()), 8, RoundingMode.DOWN));
+
+                    } else if (!"btc".equalsIgnoreCase(account.getCurrency())) {
+                        Ticker ticker = getTicker(site, account.getCurrency(), "btc");
+                        sum = sum.add(new BigDecimal(account.getBalance()).multiply(new BigDecimal(ticker.getLast())));
+                    } else {
+                        sum = sum.add(new BigDecimal(account.getBalance()));
+                    }
+                }
+                Thread.sleep(200);
+            }
+        }
+        return sum;
+    }
+
+    private BigDecimal getWalletValuation(String site) throws InterruptedException {
+        List<String> noValueCurrencies = new ArrayList<>();
+        noValueCurrencies.add("EON");
+        noValueCurrencies.add("ADD");
+        noValueCurrencies.add("CHL");
+        noValueCurrencies.add("EOP");
+        noValueCurrencies.add("EOX");
+        noValueCurrencies.add("HORUS");
+        noValueCurrencies.add("IQ");
+        noValueCurrencies.add("MEETONE");
+
+
+        BigDecimal sum = BigDecimal.ZERO;
+        List<Wallet> accounts = accountAPIService.getWallet(site);
+        if (!CollectionUtils.isEmpty(accounts)) {
+            for (Wallet account : accounts) {
+                if (noValueCurrencies.contains(account.getCurrency().toUpperCase())) {
+                    continue;
+                }
+                if (account.getBalance().compareTo(BigDecimal.ZERO) > 0) {
+                    if ("usdt".equalsIgnoreCase(account.getCurrency())) {
+                        Ticker ticker = getTicker(site, "btc", "usdt");
+                        sum = sum.add(account.getBalance().divide(new BigDecimal(ticker.getLast()), 8, RoundingMode.DOWN));
+
+                    } else if (!"btc".equalsIgnoreCase(account.getCurrency())) {
+                        Ticker ticker = getTicker(site, account.getCurrency(), "btc");
+                        sum = sum.add(account.getBalance().multiply(new BigDecimal(ticker.getLast())));
+                    } else {
+                        sum = sum.add(account.getBalance());
+                    }
+                }
+                Thread.sleep(200);
+            }
+        }
+        return sum;
+    }
 
     /**
      * 自买自卖交易
